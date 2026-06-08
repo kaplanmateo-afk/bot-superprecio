@@ -67,6 +67,9 @@ class InterpretacionUsuario:
     intencion_principal: Intencion
     acciones: list[AccionUsuario]
     respuesta_corta: str
+    ciudad: Optional[str] = None
+    posicion_a_eliminar: Optional[int] = None
+    abrir_superprecio: bool = False
 
 
 @dataclass(frozen=True)
@@ -308,7 +311,11 @@ async def clear_cart(user_id: int) -> None:
     await set_cart(user_id, [])
 
 
-async def interpretar_mensaje(texto: str) -> InterpretacionUsuario:
+async def interpretar_mensaje(
+    texto: str,
+    cart: Optional[list[CartItem]] = None,
+    city: Optional[str] = None,
+) -> InterpretacionUsuario:
     text = texto.strip().lower()
 
     if not text:
@@ -328,7 +335,7 @@ async def interpretar_mensaje(texto: str) -> InterpretacionUsuario:
             "Guardo tu zona.",
         )
 
-    ai_interpretation = await interpretar_mensaje_con_ia(texto)
+    ai_interpretation = await interpretar_mensaje_con_ia(texto, cart=cart, city=city)
     if ai_interpretation:
         return ai_interpretation
 
@@ -389,7 +396,11 @@ async def interpretar_mensaje(texto: str) -> InterpretacionUsuario:
     )
 
 
-async def interpretar_mensaje_con_ia(texto: str) -> Optional[InterpretacionUsuario]:
+async def interpretar_mensaje_con_ia(
+    texto: str,
+    cart: Optional[list[CartItem]] = None,
+    city: Optional[str] = None,
+) -> Optional[InterpretacionUsuario]:
     if not GEMINI_API_KEY:
         return None
 
@@ -440,9 +451,23 @@ async def interpretar_mensaje_con_ia(texto: str) -> Optional[InterpretacionUsuar
                 },
             },
             "respuesta_corta": {"type": "STRING"},
+            "ciudad": {"type": "STRING"},
+            "posicion_a_eliminar": {"type": "INTEGER"},
+            "abrir_superprecio": {"type": "BOOLEAN"},
         },
-        "required": ["intencion_principal", "acciones", "respuesta_corta"],
+        "required": [
+            "intencion_principal",
+            "acciones",
+            "respuesta_corta",
+            "ciudad",
+            "posicion_a_eliminar",
+            "abrir_superprecio",
+        ],
     }
+    cart_lines = []
+    for index, item in enumerate(cart or [], start=1):
+        cart_lines.append(f"{index}. {item.cantidad} x {item.query}")
+    cart_context = "\n".join(cart_lines) if cart_lines else "Lista vacia"
     prompt = f"""
 Sos el cerebro de un bot argentino de lista de supermercado.
 Converti el mensaje del usuario en acciones JSON.
@@ -455,6 +480,11 @@ Intenciones validas:
 - PREGUNTAR_PRECIOS: comparar precios o pedir donde conviene comprar.
 - NO_ENTENDIDO: si no corresponde a compras.
 
+Contexto:
+- Zona actual: {city or "sin zona"}
+- Lista actual:
+{cart_context}
+
 Reglas:
 - Si dice "ya tengo X", "saca X", "borra X", es ELIMINAR.
 - Si dice "me falta X", "anota X", "compra X", es AGREGAR.
@@ -462,7 +492,12 @@ Reglas:
 - No inventes productos.
 - Si no menciona cantidad, cantidad=1.
 - Normaliza el producto pero conserva marca, tipo o empaque si aparece.
+- Si el usuario dice "zona X", "estoy en X", "mi ciudad es X", completa ciudad con X; si no hay ciudad, ciudad="".
+- Si el usuario dice "borra el segundo", "saca el 2", completa posicion_a_eliminar con ese numero; si no aplica, usa 0.
+- Si el usuario pide abrir/cargar en SuperPrecio, abrir_superprecio=true.
+- Si pide precios y tambien abrir SuperPrecio, usa PREGUNTAR_PRECIOS y abrir_superprecio=true.
 - No trates ciudades como producto si el usuario habla de zona/ciudad.
+- respuesta_corta debe sonar natural, breve y argentina, sin explicar reglas internas.
 
 Mensaje: {texto}
 """
@@ -515,6 +550,9 @@ Mensaje: {texto}
         parsed.get("intencion_principal", "NO_ENTENDIDO"),
         actions,
         parsed.get("respuesta_corta", "Listo."),
+        ciudad=str(parsed.get("ciudad") or "").strip() or None,
+        posicion_a_eliminar=int(parsed.get("posicion_a_eliminar") or 0) or None,
+        abrir_superprecio=bool(parsed.get("abrir_superprecio", False)),
     )
 
 
@@ -958,6 +996,51 @@ async def ask_product_choice(
     return True
 
 
+async def ask_cart_item_refinement(
+    update: Update,
+    user_id: int,
+    item: CartItem,
+) -> bool:
+    if not is_generic_product_name(item.query):
+        return False
+
+    preferred = await get_preferred_product(user_id, item.query)
+    if preferred:
+        return False
+
+    city = await get_user_city(user_id)
+    offers = await buscar_mejor_precio(item.query, city=city)
+    options = product_options_from_offers(offers)
+    if len(options) <= 1:
+        return False
+
+    choice_id = uuid.uuid4().hex[:10]
+    data = await load_user_data()
+    profile = data.get(str(user_id), {})
+    pending = profile.get("pending_choices", {})
+    pending[choice_id] = {
+        "mode": "replace",
+        "original": item.query,
+        "cantidad": item.cantidad,
+        "marca": item.marca,
+        "options": [offer.product_name for offer in options],
+    }
+    profile["pending_choices"] = pending
+    data[str(user_id)] = profile
+    await save_user_data(data)
+
+    keyboard = []
+    for index, offer in enumerate(options):
+        label = f"{offer.product_name[:38]} - {money(offer.price)}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"pick:{choice_id}:{index}")])
+
+    await update.message.reply_text(
+        f"Antes de calcular precios, elegi cual queres para '{item.query}':",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return True
+
+
 async def analyze_cart(cart: list[CartItem], city: Optional[str] = None) -> CartAnalysis:
     offers_by_item: dict[str, list[PriceOffer]] = {}
 
@@ -1136,13 +1219,14 @@ def format_recommendation(analysis: CartAnalysis, city: Optional[str] = None) ->
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Mandame tu lista con frases simples. Ejemplos:\n"
-        "- agregar 2 leche, 1 arroz\n"
-        "- sacar arroz\n"
-        "- lista\n"
-        "- precios\n"
-        "- /zona Cordoba\n\n"
-        "Si un producto es muy generico, te voy a mostrar botones para elegir marca, tipo y empaque."
+        "Mandame la lista como te salga.\n\n"
+        "Ejemplos:\n"
+        "- me falta leche, arroz y fideos\n"
+        "- saca el segundo\n"
+        "- ya tengo arroz, agregame cafe\n"
+        "- estoy en Cordoba\n"
+        "- donde conviene comprar?\n\n"
+        "Si algo es muy generico, te muestro botones para elegir marca, tipo y empaque."
     )
 
 
@@ -1180,6 +1264,12 @@ async def cmd_precios(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not cart:
         await update.message.reply_text("Tu lista esta vacia. Agrega productos primero.")
         return
+
+    for item in cart:
+        asked = await ask_cart_item_refinement(update, user_id, item)
+        if asked:
+            await update.message.reply_text("Cuando elijas, mandame 'precios' de nuevo.")
+            return
 
     city = await get_user_city(user_id)
     place = f" para {city}" if city else ""
@@ -1236,6 +1326,7 @@ async def handle_product_choice(update: Update, context: ContextTypes.DEFAULT_TY
     original = choice["original"]
     cantidad = int(choice.get("cantidad", 1))
     marca = choice.get("marca")
+    mode = choice.get("mode", "add")
 
     if selected == "raw":
         selected_product = original
@@ -1247,6 +1338,9 @@ async def handle_product_choice(update: Update, context: ContextTypes.DEFAULT_TY
             return
         selected_product = options[index]
         await set_preferred_product(user_id, original, selected_product)
+
+    if mode == "replace":
+        await remove_items(user_id, [ProductoInterpretado(producto=original, marca=marca, cantidad=10_000)])
 
     await add_items(
         user_id,
@@ -1303,12 +1397,34 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     try:
-        interpretation = await interpretar_mensaje(text)
+        cart_before = await get_cart(user_id)
+        city_before = await get_user_city(user_id)
+        interpretation = await interpretar_mensaje(text, cart=cart_before, city=city_before)
     except Exception as exc:
         await update.message.reply_text(
             f"No pude interpretar el mensaje. Error: {exc}"
         )
         return
+
+    if interpretation.ciudad:
+        await set_user_city(user_id, interpretation.ciudad)
+        await update.message.reply_text(f"Listo, guarde tu zona: {interpretation.ciudad.title()}")
+        if interpretation.intencion_principal == "NO_ENTENDIDO" and not interpretation.abrir_superprecio:
+            return
+
+    if interpretation.posicion_a_eliminar:
+        removed = await remove_item_by_position(user_id, interpretation.posicion_a_eliminar)
+        cart = await get_cart(user_id)
+        if removed:
+            await update.message.reply_text(
+                f"Listo, saque el item {interpretation.posicion_a_eliminar}.\n\n{format_cart(cart)}"
+            )
+        else:
+            await update.message.reply_text(
+                f"No encontre un item {interpretation.posicion_a_eliminar} en tu lista.\n\n{format_cart(cart)}"
+            )
+        if interpretation.intencion_principal == "NO_ENTENDIDO" and not interpretation.abrir_superprecio:
+            return
 
     actions = interpretation.acciones or [
         AccionUsuario(intencion=interpretation.intencion_principal, productos=[])
@@ -1338,6 +1454,12 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if should_quote_prices:
         await cmd_precios(update, context)
+        if interpretation.abrir_superprecio:
+            await cmd_superprecio(update, context)
+        return
+
+    if interpretation.abrir_superprecio:
+        await cmd_superprecio(update, context)
         return
 
     if should_show_list or touched_cart:
