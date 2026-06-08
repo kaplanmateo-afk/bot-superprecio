@@ -34,6 +34,8 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "18"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "telegram-webhook")
 PORT = int(os.getenv("PORT", "10000"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 data_lock = asyncio.Lock()
 
@@ -326,6 +328,10 @@ async def interpretar_mensaje(texto: str) -> InterpretacionUsuario:
             "Guardo tu zona.",
         )
 
+    ai_interpretation = await interpretar_mensaje_con_ia(texto)
+    if ai_interpretation:
+        return ai_interpretation
+
     if text in {"lista", "ver lista", "mi lista", "/lista"}:
         return InterpretacionUsuario(
             "VER_LISTA",
@@ -380,6 +386,135 @@ async def interpretar_mensaje(texto: str) -> InterpretacionUsuario:
         "NO_ENTENDIDO",
         [],
         "No termine de entender. Proba con: agregar 2 leche, sacar arroz, lista o precios.",
+    )
+
+
+async def interpretar_mensaje_con_ia(texto: str) -> Optional[InterpretacionUsuario]:
+    if not GEMINI_API_KEY:
+        return None
+
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "intencion_principal": {
+                "type": "STRING",
+                "enum": [
+                    "AGREGAR",
+                    "ELIMINAR",
+                    "VER_LISTA",
+                    "LIMPIAR_LISTA",
+                    "PREGUNTAR_PRECIOS",
+                    "NO_ENTENDIDO",
+                ],
+            },
+            "acciones": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "intencion": {
+                            "type": "STRING",
+                            "enum": [
+                                "AGREGAR",
+                                "ELIMINAR",
+                                "VER_LISTA",
+                                "LIMPIAR_LISTA",
+                                "PREGUNTAR_PRECIOS",
+                                "NO_ENTENDIDO",
+                            ],
+                        },
+                        "productos": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "producto": {"type": "STRING"},
+                                    "marca": {"type": "STRING", "nullable": True},
+                                    "cantidad": {"type": "INTEGER"},
+                                },
+                                "required": ["producto", "cantidad"],
+                            },
+                        },
+                    },
+                    "required": ["intencion", "productos"],
+                },
+            },
+            "respuesta_corta": {"type": "STRING"},
+        },
+        "required": ["intencion_principal", "acciones", "respuesta_corta"],
+    }
+    prompt = f"""
+Sos el cerebro de un bot argentino de lista de supermercado.
+Converti el mensaje del usuario en acciones JSON.
+
+Intenciones validas:
+- AGREGAR: sumar productos a la lista.
+- ELIMINAR: sacar productos de la lista.
+- VER_LISTA: ver lo anotado.
+- LIMPIAR_LISTA: vaciar toda la lista.
+- PREGUNTAR_PRECIOS: comparar precios o pedir donde conviene comprar.
+- NO_ENTENDIDO: si no corresponde a compras.
+
+Reglas:
+- Si dice "ya tengo X", "saca X", "borra X", es ELIMINAR.
+- Si dice "me falta X", "anota X", "compra X", es AGREGAR.
+- Si mezcla acciones, devolve varias acciones.
+- No inventes productos.
+- Si no menciona cantidad, cantidad=1.
+- Normaliza el producto pero conserva marca, tipo o empaque si aparece.
+- No trates ciudades como producto si el usuario habla de zona/ciudad.
+
+Mensaje: {texto}
+"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+    except Exception:
+        return None
+
+    actions: list[AccionUsuario] = []
+    for action in parsed.get("acciones", []):
+        products = []
+        for product in action.get("productos", []):
+            name = str(product.get("producto", "")).strip()
+            if not name:
+                continue
+            try:
+                quantity = max(int(product.get("cantidad", 1)), 1)
+            except (TypeError, ValueError):
+                quantity = 1
+            brand = product.get("marca")
+            products.append(
+                ProductoInterpretado(
+                    producto=name,
+                    marca=str(brand).strip() if brand else None,
+                    cantidad=quantity,
+                )
+            )
+        actions.append(AccionUsuario(action.get("intencion", "NO_ENTENDIDO"), products))
+
+    return InterpretacionUsuario(
+        parsed.get("intencion_principal", "NO_ENTENDIDO"),
+        actions,
+        parsed.get("respuesta_corta", "Listo."),
     )
 
 
