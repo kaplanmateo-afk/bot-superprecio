@@ -592,6 +592,15 @@ def parse_productos_simples(text: str) -> list[ProductoInterpretado]:
 
         cantidad = int(match.group(1) or "1")
         name = match.group(2).strip()
+        trailing_qty = re.search(r"\s+[xX]\s*(\d+)$", name)
+        if trailing_qty:
+            cantidad = int(trailing_qty.group(1))
+            name = name[: trailing_qty.start()].strip()
+        else:
+            trailing_plain_qty = re.search(r"\s+(\d+)$", name)
+            if trailing_plain_qty and not re.search(r"\b(kg|gr|g|ml|l|lt)\s*\d+$", name.lower()):
+                cantidad = int(trailing_plain_qty.group(1))
+                name = name[: trailing_plain_qty.start()].strip()
         name = re.sub(r"^(de|del|la|el|los|las)\s+", "", name)
         name = re.sub(
             r"\b(agregar|agrega|sumar|suma|anotar|anota|comprar|compra|sacar|saca|quitar|quita|borrar|borra|eliminar|elimina)\b",
@@ -954,6 +963,10 @@ def product_options_for_query(query: str, offers: list[PriceOffer], limit: int =
     return sorted(options, key=rank)[:limit]
 
 
+def option_button_label(offer: PriceOffer, index: int) -> str:
+    return f"{index + 1}. {offer.supermarket} {money(offer.price)}"
+
+
 def is_generic_product_name(name: str) -> bool:
     words = [word for word in re.split(r"\s+", name.strip()) if word]
     specific_tokens = ("kg", "gr", "g", "litro", "lt", "ml", "x", "pack")
@@ -990,36 +1003,16 @@ async def ask_product_choice(
     user_id: int,
     product: ProductoInterpretado,
 ) -> bool:
-    preferred = await get_preferred_product(user_id, product.producto)
-    if preferred:
-        await add_items(
-            user_id,
-            [
-                ProductoInterpretado(
-                    producto=preferred,
-                    marca=product.marca,
-                    cantidad=product.cantidad,
-                )
-            ],
-        )
-        return False
-
     if not is_generic_product_name(product.producto):
         await add_items(user_id, [product])
         return False
+
+    await add_items(user_id, [product])
 
     city = await get_user_city(user_id)
     offers = await buscar_mejor_precio(product.producto, city=city)
     options = product_options_for_query(product.producto, offers)
     if len(options) <= 1:
-        if options:
-            await set_preferred_product(user_id, product.producto, options[0].product_name)
-            await add_items(
-                user_id,
-                [ProductoInterpretado(options[0].product_name, product.marca, product.cantidad)],
-            )
-        else:
-            await add_items(user_id, [product])
         return False
 
     choice_id = uuid.uuid4().hex[:10]
@@ -1027,6 +1020,7 @@ async def ask_product_choice(
     profile = data.get(str(user_id), {})
     pending = profile.get("pending_choices", {})
     pending[choice_id] = {
+        "mode": "replace",
         "original": product.producto,
         "cantidad": product.cantidad,
         "marca": product.marca,
@@ -1038,12 +1032,20 @@ async def ask_product_choice(
 
     keyboard = []
     for index, offer in enumerate(options):
-        label = f"{offer.product_name[:38]} - {money(offer.price)}"
+        label = option_button_label(offer, index)
         keyboard.append([InlineKeyboardButton(label, callback_data=f"pick:{choice_id}:{index}")])
-    keyboard.append([InlineKeyboardButton("Ninguno, dejar como lo escribi", callback_data=f"pick:{choice_id}:raw")])
+    keyboard.append([InlineKeyboardButton("Dejar como lo escribi", callback_data=f"pick:{choice_id}:raw")])
 
+    cart = await get_cart(user_id)
+    option_lines = [
+        f"{index + 1}. {short_product_name(offer.product_name, 58)} - {offer.supermarket} {money(offer.price)}"
+        for index, offer in enumerate(options)
+    ]
     await update.message.reply_text(
-        f"Para '{product.producto}' encontre varias opciones. Elegi cual queres guardar:",
+        f"Lo anote como '{product.producto}'.\n\n"
+        f"{format_cart(cart)}\n\n"
+        "Si queres precisar marca o empaque, elegi una opcion:\n"
+        + "\n".join(option_lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return True
@@ -1055,10 +1057,6 @@ async def ask_cart_item_refinement(
     item: CartItem,
 ) -> bool:
     if not is_generic_product_name(item.query):
-        return False
-
-    preferred = await get_preferred_product(user_id, item.query)
-    if preferred:
         return False
 
     city = await get_user_city(user_id)
@@ -1084,11 +1082,16 @@ async def ask_cart_item_refinement(
 
     keyboard = []
     for index, offer in enumerate(options):
-        label = f"{offer.product_name[:38]} - {money(offer.price)}"
+        label = option_button_label(offer, index)
         keyboard.append([InlineKeyboardButton(label, callback_data=f"pick:{choice_id}:{index}")])
 
+    option_lines = [
+        f"{index + 1}. {short_product_name(offer.product_name, 58)} - {offer.supermarket} {money(offer.price)}"
+        for index, offer in enumerate(options)
+    ]
     await update.message.reply_text(
-        f"Antes de calcular precios, elegi cual queres para '{item.query}':",
+        f"Antes de calcular precios, elegi cual queres para '{item.query}':\n"
+        + "\n".join(option_lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return True
@@ -1390,7 +1393,6 @@ async def handle_product_choice(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("No pude leer esa opcion.")
             return
         selected_product = options[index]
-        await set_preferred_product(user_id, original, selected_product)
 
     if mode == "replace":
         await remove_items(user_id, [ProductoInterpretado(producto=original, marca=marca, cantidad=10_000)])
