@@ -70,6 +70,8 @@ class InterpretacionUsuario:
     ciudad: Optional[str] = None
     posicion_a_eliminar: Optional[int] = None
     abrir_superprecio: bool = False
+    necesita_aclaracion: bool = False
+    pregunta_aclaracion: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +456,8 @@ async def interpretar_mensaje_con_ia(
             "ciudad": {"type": "STRING"},
             "posicion_a_eliminar": {"type": "INTEGER"},
             "abrir_superprecio": {"type": "BOOLEAN"},
+            "necesita_aclaracion": {"type": "BOOLEAN"},
+            "pregunta_aclaracion": {"type": "STRING"},
         },
         "required": [
             "intencion_principal",
@@ -462,6 +466,8 @@ async def interpretar_mensaje_con_ia(
             "ciudad",
             "posicion_a_eliminar",
             "abrir_superprecio",
+            "necesita_aclaracion",
+            "pregunta_aclaracion",
         ],
     }
     cart_lines = []
@@ -498,6 +504,11 @@ Reglas:
 - Si pide precios y tambien abrir SuperPrecio, usa PREGUNTAR_PRECIOS y abrir_superprecio=true.
 - No trates ciudades como producto si el usuario habla de zona/ciudad.
 - respuesta_corta debe sonar natural, breve y argentina, sin explicar reglas internas.
+- Actua como una persona practica: si falta un dato importante, no adivines.
+- Si el mensaje es ambiguo, necesita_aclaracion=true y pregunta_aclaracion debe ser una sola pregunta breve.
+- Si el usuario dice algo como "borra eso", "saca lo anterior", "sumame lo mismo", y no es claro por el contexto, repregunta.
+- Si el usuario pide un producto generico pero comprable ("leche", "arroz", "pan"), no repreguntes: el sistema le mostrara opciones de SuperPrecio.
+- Si no necesitas aclarar, necesita_aclaracion=false y pregunta_aclaracion="".
 
 Mensaje: {texto}
 """
@@ -553,6 +564,8 @@ Mensaje: {texto}
         ciudad=str(parsed.get("ciudad") or "").strip() or None,
         posicion_a_eliminar=int(parsed.get("posicion_a_eliminar") or 0) or None,
         abrir_superprecio=bool(parsed.get("abrir_superprecio", False)),
+        necesita_aclaracion=bool(parsed.get("necesita_aclaracion", False)),
+        pregunta_aclaracion=str(parsed.get("pregunta_aclaracion") or "").strip() or None,
     )
 
 
@@ -901,6 +914,46 @@ def product_options_from_offers(offers: list[PriceOffer], limit: int = 5) -> lis
     return sorted(best_by_product.values(), key=lambda offer: offer.price)[:limit]
 
 
+def product_options_for_query(query: str, offers: list[PriceOffer], limit: int = 5) -> list[PriceOffer]:
+    query_norm = query.lower().strip()
+    query_tokens = [token for token in re.split(r"\W+", query_norm) if len(token) > 2]
+
+    options = product_options_from_offers(offers, limit=40)
+    if query_norm == "leche":
+        options = [
+            offer
+            for offer in options
+            if re.search(r"\bleche\b", offer.product_name.lower())
+            and "dulce de leche" not in offer.product_name.lower()
+            and "galleta" not in offer.product_name.lower()
+            and "galletita" not in offer.product_name.lower()
+            and "yogur" not in offer.product_name.lower()
+            and "chocolatada" not in offer.product_name.lower()
+        ]
+
+    if query_tokens:
+        strict = [
+            offer
+            for offer in options
+            if all(token in offer.product_name.lower() for token in query_tokens)
+        ]
+        if strict:
+            options = strict
+
+    def rank(offer: PriceOffer) -> tuple[int, Decimal, str]:
+        name = offer.product_name.lower()
+        score = 0
+        if name.startswith(query_norm):
+            score -= 3
+        if re.search(rf"\b{re.escape(query_norm)}\b", name):
+            score -= 2
+        if any(unit in name for unit in ("1 l", "1l", "litro", "1000 ml")):
+            score -= 1
+        return score, offer.price, offer.product_name
+
+    return sorted(options, key=rank)[:limit]
+
+
 def is_generic_product_name(name: str) -> bool:
     words = [word for word in re.split(r"\s+", name.strip()) if word]
     specific_tokens = ("kg", "gr", "g", "litro", "lt", "ml", "x", "pack")
@@ -957,7 +1010,7 @@ async def ask_product_choice(
 
     city = await get_user_city(user_id)
     offers = await buscar_mejor_precio(product.producto, city=city)
-    options = product_options_from_offers(offers)
+    options = product_options_for_query(product.producto, offers)
     if len(options) <= 1:
         if options:
             await set_preferred_product(user_id, product.producto, options[0].product_name)
@@ -1010,7 +1063,7 @@ async def ask_cart_item_refinement(
 
     city = await get_user_city(user_id)
     offers = await buscar_mejor_precio(item.query, city=city)
-    options = product_options_from_offers(offers)
+    options = product_options_for_query(item.query, offers)
     if len(options) <= 1:
         return False
 
@@ -1219,7 +1272,7 @@ def format_recommendation(analysis: CartAnalysis, city: Optional[str] = None) ->
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Mandame la lista como te salga.\n\n"
+        "Mandame la lista como te salga. Si me falta un dato, te pregunto antes de tocar nada.\n\n"
         "Ejemplos:\n"
         "- me falta leche, arroz y fideos\n"
         "- saca el segundo\n"
@@ -1406,7 +1459,9 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if interpretation.ciudad:
+    city_words = ("zona", "ciudad", "localidad", "estoy en", "vivo en", "soy de")
+    mentioned_city = any(word in lower_text for word in city_words)
+    if interpretation.ciudad and (mentioned_city or not city_before):
         await set_user_city(user_id, interpretation.ciudad)
         await update.message.reply_text(f"Listo, guarde tu zona: {interpretation.ciudad.title()}")
         if interpretation.intencion_principal == "NO_ENTENDIDO" and not interpretation.abrir_superprecio:
@@ -1426,6 +1481,10 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if interpretation.intencion_principal == "NO_ENTENDIDO" and not interpretation.abrir_superprecio:
             return
 
+    if interpretation.necesita_aclaracion and interpretation.pregunta_aclaracion:
+        await update.message.reply_text(interpretation.pregunta_aclaracion)
+        return
+
     actions = interpretation.acciones or [
         AccionUsuario(intencion=interpretation.intencion_principal, productos=[])
     ]
@@ -1440,6 +1499,8 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for product in action.productos:
                 asked_choice = await ask_product_choice(update, user_id, product)
                 asked_any_choice = asked_any_choice or asked_choice
+            if asked_any_choice:
+                return
             touched_cart = not asked_any_choice
         elif action.intencion == "ELIMINAR" and action.productos:
             await remove_items(user_id, action.productos)
@@ -1468,7 +1529,7 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text(
-        "No termine de entender si queres agregar, quitar, ver la lista o consultar precios."
+        "Me quede con la duda. ¿Queres agregar algo, sacar algo, ver la lista o comparar precios?"
     )
 
 
